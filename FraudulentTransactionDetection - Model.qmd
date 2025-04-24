@@ -1,0 +1,746 @@
+---
+title: "BUSINFO 704 2024 Quarter 3 \n Final Project - Bank Fraud Detection"
+author: "Group 22"
+format: html
+---
+
+# Set-up
+
+```{r, results = "hide", message=FALSE}
+
+
+
+packages_needed <-  c( 
+                      "GGally",
+                      "tidymodels",
+                      "lubridate",
+                      "themis", #recipe steps for unbalanced data
+                      "kknn", #k nearest neighbour
+                      "rpart",  #decision trees
+                      "rpart.plot", #plotting decision trees
+                      "baguette", 
+                      "ranger", #random forests
+                      "xgboost", #xgboost
+                      "lightgbm", "bonsai" #lightgbm
+                      , "parallel", "future",
+                      "broom", "parsnip", "tune", "corrplot", "purrr", "tidyr",
+                      "readr", "tidyverse"
+                      )
+packages_to_install <- packages_needed[!packages_needed %in%
+                                         installed.packages()]
+sapply(packages_to_install, install.packages,
+       dependencies=TRUE, repos="https://cloud.r-project.org")
+sapply(packages_needed, require, character=TRUE)
+
+cores <- parallel::detectCores(logical = TRUE)
+plan(multisession) #parallel processing
+
+b <-read_csv('Data/bank_A_transactions_20240731.csv')
+```
+
+# Business Problem
+
+Detecting Fradulent Transactions
+
+# Data Preparation
+
+```{r}
+#| label: data-prep
+
+bddemo <- 
+  b |>
+  mutate(
+    FraudLabel = factor(FraudLabel, levels = c(1,0)),
+    TransactionDay = day(TransactionDate),
+    TransactionWeekday = wday(TransactionDate, label = TRUE, abbr = FALSE),
+    TransactionHour = hour(TransactionDate),
+    MerchantID = ifelse(is.na(MerchantID), "1", "0"))
+
+```
+
+# EDA and Visuals for Poster
+
+```{r}
+#Understand the proportions of fraud vs non-fraud
+bddemo |> 
+  count(FraudLabel) |> 
+  mutate(prop = n/sum(n))
+
+#create another dataset of just the Fraud transactions
+Frauds <- bddemo |> 
+  filter(FraudLabel == 1)
+
+#categorising hour into categorical bins to explore relationship 
+BankA_1 <- bddemo |> 
+  mutate(TimeOfDay = case_when(
+    TransactionHour >= 0 & TransactionHour < 4 ~ "Early Morning\n0-4",
+    TransactionHour >= 4 & TransactionHour < 8 ~ "Morning\n4-8",
+    TransactionHour >= 8 & TransactionHour < 12 ~ "Late Morning\n8-12",
+    TransactionHour >= 12 & TransactionHour < 16 ~ "Afternoon\n12-16",
+    TransactionHour >= 16 & TransactionHour < 20 ~ "Evening\n16-20",
+    TransactionHour >= 20 & TransactionHour < 24 ~ "Night\n20-24"
+  ))
+
+# Convert TimeOfDay to a factor with specific levels for ordering
+BankA_1$TimeOfDay <- factor(BankA_1$TimeOfDay,
+                            levels = c("Early Morning\n0-4", "Morning\n4-8", "Late Morning\n8-12", 
+                                       "Afternoon\n12-16", "Evening\n16-20", "Night\n20-24"))
+
+
+#-----------------------------EXPLORATORY ANALYSIS---------------------------#
+
+# Summary statistics table by FraudLabel
+(summary_stats <- BankA_1 |> 
+    group_by(FraudLabel) |> 
+    summarise(
+      count = n(),
+      mean_transaction_amount = mean(TransactionAmount),
+      sd_transaction_amount = sd(TransactionAmount),
+      median_transaction_amount = median(TransactionAmount),
+      min_transaction_amount = min(TransactionAmount),
+      max_transaction_amount = max(TransactionAmount),
+      mean_age = mean(Age),
+      sd_age = sd(Age),
+      median_age = median(Age),
+      min_age = min(Age),
+      max_age = max(Age),
+      mean_balance = mean(balance),
+      sd_balance = sd(balance),
+      median_balance = median(balance),
+      min_balance = min(balance),
+      max_balance = max(balance)
+    ))
+
+#Age vs. FraudLabel
+ggplot(BankA_1, 
+       aes(x = FraudLabel, y = Age)) +
+  geom_boxplot() +
+  theme_minimal() +
+  labs(title = "Customer Age by Fraud Label")
+#theFrauds transactions have higher median age vs. the non-frauds
+
+
+# Fraudulent transactions by TransactionType
+ggplot(Frauds, aes(x = TransactionType, fill = FraudLabel)) +
+  geom_bar(position = "dodge") +
+  theme_minimal() +
+  labs(title = "Fraudulent Transactions by Type")
+
+
+# Correlation plot
+numeric_data <- BankA_1 |> 
+  select(TransactionAmount, Age, balance)
+
+corr_matrix <- cor(numeric_data, use = "complete.obs")
+
+#visualise the correlation
+corrplot(corr_matrix, method = "circle")
+
+#Age vs TransactionAmount 
+ggplot(Frauds,
+       aes(x = Age, y = TransactionAmount))+
+  geom_point()
+
+#Age vs balance
+ggplot(Frauds,
+       aes(x = Age, y = balance))+
+  geom_point()
+
+# Distribution of TransactionAmount
+ggplot(Frauds, 
+       aes(x = Age, y = TransactionAmount)) +
+  geom_col(postion = "dodge") +
+  theme_minimal() +
+  labs(title = "Distribution of Transaction Amounts")
+
+
+#additional bar charts were run too, but they are listed in the below section 'visuals for poster' since we decided to pick those graphs to be placed in the poster
+
+```
+
+
+```{r}
+#Chisquare test
+
+#chi-square tests to test the signficance of relationships between fraudlabel vs selected variable.
+
+# Identify categorical variables in the dataframe
+categorical_vars <- bddemo |> 
+  select(where(is.factor), where(is.character)) |> 
+  select(-FraudLabel) # Remove FraudLabel from the list if it's included
+
+# Function to run chi-square test for each categorical variable
+run_chi_square <- function(var) {
+  table <- table(bddemo[[var]], bddemo$FraudLabel)# Create contingency table
+  chisq_test <- chisq.test(table)  # Run Chi-square test and # Store the result in a data frame
+  result <- data.frame(Variable = var, 
+                       Chi_Square = chisq_test$statistic, 
+                       p_value = chisq_test$p.value,
+                       stringsAsFactors = FALSE)
+  return(result)
+}
+
+# Apply the function to each categorical variable and combine results
+chi_square_results <- map_df(names(categorical_vars), run_chi_square)
+
+# Display the results
+print(chi_square_results)
+
+#ChiSquare Results: 
+# non-significant variables: both TransactionID (p-value ≈ 0.5) and MerchantID (p-value ≈ 0.188), joint flag - not significant association with fraud.
+# significant variables: TransactionWeekday, CustomerID,MerchantLocation,TransactionType and AccountiD - significant association with fraud.
+
+#------------------------------------------------------------------------------------------#
+#T-test :  for fraud label vs. Numeric variables
+
+# Select numeric variables
+numeric_vars <- bddemo |> 
+  select(where(is.numeric))
+
+# Initialize an empty dataframe to store the results
+t_test_results <- data.frame(Variable = character(),
+                             t_statistic = numeric(),
+                             p_value = numeric(),
+                             stringsAsFactors = FALSE)
+
+# Loop through each numeric variable and perform t-test
+for (var in names(numeric_vars)) {
+  t_test <- t.test(numeric_vars[[var]] ~ bddemo$FraudLabel)
+  
+  # Store the results
+  t_test_results <- rbind(t_test_results, 
+                          data.frame(Variable = var,
+                                     t_statistic = t_test$statistic,
+                                     p_value = t_test$p.value))
+}
+
+# View the results
+print(t_test_results)
+
+#T-Test results
+#significant variables - TransactionAmount, Age, TransactionDay and Hour (marginally significant)
+#not significant variables - balance
+
+```
+
+Visuals for Poster
+```{r}
+
+#-------------------------- VISUALS FOR POSTER -------------------------------#
+
+#0. TransactionType vs. Fraud Label
+
+
+a <- Frauds |> 
+  count(TransactionType) |> 
+  mutate(prop = n/sum(n))
+
+type_fraud <- BankA_1 |> 
+  group_by(TransactionType) |> 
+  summarise(FraudCount = sum(FraudLabel == 1),
+            TotalCount = n(),
+            FraudRate = FraudCount / TotalCount * 100)
+
+
+#1. Fraudulent transactions by day of the week
+weekday_fraud <- BankA_1 |> 
+  group_by(TransactionWeekday) |> 
+  summarise(FraudCount = sum(FraudLabel == 1),
+            TotalCount = n(),
+            FraudRate = FraudCount / TotalCount * 100)
+
+# Plot the fraud rate by day of the week
+ggplot(weekday_fraud, aes(x = TransactionWeekday, y = FraudRate)) +
+  geom_bar(stat = "identity", fill = "darkblue") +
+  geom_text(aes(label = sprintf("%.1f%%", FraudRate)), vjust = -0.5) +  # Add percentage labels on top of bars
+  labs(
+    title = "Fraud Rate by Day of the Week",
+    x = "Day of the Week",
+    y = "Fraud Rate (%)"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.major = element_blank(),  # Remove major gridlines
+    panel.grid.minor = element_blank(),  # Remove minor gridlines
+    panel.grid.major.x = element_blank(), # Remove major vertical gridlines
+    panel.grid.minor.x = element_blank()  # Remove minor vertical gridlines
+  )
+#Wednesday is susceptible for fraudulent transactions.
+
+#2. Fraudulent transactions by TimeOfDay
+timeofday_fraud <- BankA_1 |> 
+  group_by(TimeOfDay) |> 
+  summarise(FraudCount = sum(FraudLabel == 1),
+            TotalCount = n(),
+            FraudRate = FraudCount / TotalCount * 100)
+
+# Plot the fraud rate by hour of the day
+ggplot(timeofday_fraud, aes(x = TimeOfDay, y = FraudRate)) +
+  geom_bar(stat = "identity", fill = "darkblue") +
+  theme_minimal() +
+  labs(title = "Fraud Rate by TimeOfDay",
+       x = "Time of Day",
+       y = "Fraud Rate (%)") +
+  theme_minimal() +
+  theme(
+    panel.grid.major = element_blank(),  # Remove major gridlines
+    panel.grid.minor = element_blank(),  # Remove minor gridlines
+    panel.grid.major.x = element_blank(), # Remove major vertical gridlines
+    panel.grid.minor.x = element_blank()  # Remove minor vertical gridlines
+  )
+
+```
+
+```{r}
+#data prep and variable selection for model
+
+bd <- bddemo |>
+    mutate(
+    TransactionHour = as.numeric(TransactionHour)) |> 
+    mutate(TimeOfDay = case_when(
+      TransactionHour >= 0 & TransactionHour < 4 ~ "Early Morning",
+      TransactionHour >= 4 & TransactionHour < 8 ~ "Morning",
+      TransactionHour >= 8 & TransactionHour < 12 ~ "Late Morning",
+      TransactionHour >= 12 & TransactionHour < 16 ~ "Afternoon",
+      TransactionHour >= 16 & TransactionHour < 20 ~ "Evening",
+      TransactionHour >= 20 & TransactionHour < 24 ~ "Night"))|>
+    select(TransactionID, FraudLabel, Age, TransactionAmount, TimeOfDay, TransactionType, TransactionWeekday)
+
+```
+
+
+# Modelling
+
+## Pre-processing - 
+### Partition data using $k$-fold cross-validation
+
+80% training, 20% test
+
+```{r}
+#| label: data-partition
+
+set.seed(222) # This enables the analysis to be reproducible 
+
+# Split 8/10 of the data into the training set 
+data_split <- initial_split(bd, prop = 0.8, strata = FraudLabel)
+
+# Create data frames for the three sets:
+bank_train_data <- training(data_split)
+bank_test_data  <- testing(data_split)
+
+
+# Create folds
+set.seed(987)
+cv_folds <- vfold_cv(bank_train_data, 
+          v = 10, 
+          strata = FraudLabel) 
+
+```
+
+### Pre-process data (create recipe)
+
+```{r}
+#| label: recipe
+
+bank_recipe <- 
+  # create recipe and specify formula
+  recipe(FraudLabel ~ ., data = bank_train_data)  |>  
+  # update role of ID variables  
+  update_role(TransactionID, new_role = "ID") |> 
+  # normalize variables  
+  step_normalize(all_numeric_predictors())  |> 
+  # create dummy variables for nominal predictors
+  step_dummy(all_nominal_predictors())|> 
+  # remove zero variance predictors
+  step_zv(all_predictors()) |> 
+  # synthetic samples generated to balance imbalanced datasets, specifically targeting the minority class (Fraud)
+  step_smote(FraudLabel)
+
+```
+
+#### Inspect impact of recipe
+
+```{r, results = "hide"}
+#| label: inspect-recipe
+
+glimpse(bank_train_data)
+bank_recipe |> 
+  prep() |> 
+  bake(bank_train_data)
+```
+
+## Train
+
+### Define model and workflow specification for each algorithm
+
+#### Logistic regression
+
+```{r}
+#| label: lr-model-defn
+
+#lr_model <- 
+  #logistic_reg() |> 
+  #set_engine("glm") |>
+  #set_mode("classification") 
+
+#lr_wflow <- workflow() |> 
+               #   add_model(lr_model) |> 
+                #  add_recipe(bank_recipe)
+#lr_wflow
+```
+
+$k$**-Nearest Neighbours**
+
+```{r}
+#| label: knn-model-defn
+
+#knn_model <-
+ # nearest_neighbor(neighbors = 5) |>
+ # set_engine('kknn') |>
+ # set_mode('classification')
+
+
+# knn_wflow <- workflow() |> 
+  #                add_model(knn_model) |> 
+  #                add_recipe(bank_recipe)
+```
+
+#### Random Forests
+
+```{r}
+#| label: rf-model-defn
+
+# rf_model <- 
+  # rand_forest(trees = 1000) |> 
+  # set_engine("ranger", 
+    #         importance = "impurity") |> 
+  # set_mode("classification")
+
+# rf_wflow <-   workflow() |> 
+  # add_model(rf_model) |> 
+  # add_recipe(bank_recipe)
+```
+
+#### XGBoost
+
+```{r}
+#| label: xgb-model-defn
+
+xgb_model <- 
+ boost_tree() |>
+  set_engine("xgboost" ) |>
+  set_mode("classification") 
+
+xgb_wflow <- 
+  workflow() |> 
+  add_model(xgb_model) |> 
+  add_recipe(bank_recipe)
+```
+
+#### LightGBM
+
+A faster boosted tree method
+
+```{r}
+#| label: lgbm-model-defn
+
+lgbm_model <- 
+  boost_tree() |>
+  set_engine("lightgbm" ) |>
+  set_mode("classification") 
+
+lgbm_wflow <- 
+  workflow() |> 
+  add_model(lgbm_model) |> 
+  add_recipe(bank_recipe)
+```
+
+### Use workflow to fit model to folds construction from training data
+
+Define metric set to use for evaluation
+
+```{r}
+#| label: metrics
+
+bank_metrics <- metric_set(accuracy, roc_auc, sensitivity, specificity, bal_accuracy, ppv, npv  )
+
+```
+
+Use the function `fit_resamples` to fit using $k$ fold cross validation
+
+```{r}
+#| label: run-lr
+
+#Sys.time()
+
+#lr_res <- lr_wflow |>
+ # fit_resamples(
+  # resamples = cv_folds, 
+   #metrics = bank_metrics,
+   #control = control_grid(save_pred = TRUE,
+    #                      parallel_over = "everything")
+    # ) 
+
+#Sys.time()  
+
+
+# It is possible to extract coefficients 
+# See https://www.kirenz.com/blog/posts/2021-02-17-r-classification-tidymodels/#data-preparation  for details
+
+```
+
+```{r}
+#| label: run-other-models
+
+#Sys.time()
+
+#knn_res <- knn_wflow |>
+ # fit_resamples(
+  #   resamples = cv_folds, 
+   #  metrics = bank_metrics,
+    # control = control_grid(save_pred = TRUE,
+     #                      parallel_over = "everything")) 
+#Sys.time()
+
+#rf_res <- rf_wflow |>
+  #fit_resamples(
+    # resamples = cv_folds, 
+    # metrics = bank_metrics,
+     #control = control_grid(save_pred = TRUE,
+                        #    parallel_over = "everything")
+  #  ) 
+
+Sys.time()
+xgb_res <- xgb_wflow |>
+  fit_resamples(
+    resamples = cv_folds, 
+    metrics = bank_metrics,
+    control = control_grid(save_pred = TRUE,
+                            parallel_over = "everything")
+    ) 
+
+
+Sys.time()
+
+
+#lgbm_res <- lgbm_wflow |>
+ # fit_resamples(
+ #    resamples = cv_folds, 
+  #   metrics = bank_metrics,
+  #   control = control_grid(save_pred = TRUE,
+  #                          parallel_over = "everything")
+   # ) 
+
+
+# Sys.time()
+
+```
+
+### Examine results (e.g. mean AUC-ROC, mean sensitivity) across all folds for each model
+
+1.  Logisitc Regression
+
+```{r}
+#| label: lr-res
+
+#lr_res |> collect_metrics(summarize = FALSE)
+
+# average across all folds
+#| label: lr-res2
+#lr_res |> collect_metrics(summarize = TRUE)
+
+#| label:lr-pred
+#lr_pred <- 
+ # lr_res |>
+  #collect_predictions()
+
+#| label: lr-confmat
+#lr_pred |>
+  #conf_mat(truth = FraudLabel, .pred_class) 
+
+#| label: lr-roc
+
+#lr_pred |>
+ # group_by(id) |># id contains our folds
+  #roc_curve(FraudLabel, .pred_1) |>
+  #autoplot()
+```
+
+1.  Other Models - examine results across all folds for each model
+
+```{r, eval = FALSE}
+#| label: get-res
+
+#individudal results
+#knn_res  |> collect_metrics(summarize = TRUE)
+#rf_res   |> collect_metrics(summarize = TRUE)
+xgb_res  |> collect_metrics(summarize = TRUE)
+#lgbm_res |> collect_metrics(summarize = TRUE)
+```
+
+```{r}
+#| label: all-res
+
+# Combine results
+all_res <- 
+bind_rows(
+#lr_res   |> collect_metrics(summarize = TRUE) |> mutate(model = "Logistic Regression"),
+#knn_res  |> collect_metrics(summarize = TRUE) |> mutate(model = "KNN"),
+#rf_res   |> collect_metrics(summarize = TRUE) |> mutate(model = "Random Forest"),
+xgb_res  |> collect_metrics(summarize = TRUE) |> mutate(model = "XGBoost"),
+#lgbm_res |> collect_metrics(summarize = TRUE) |> mutate(model = "LightGBM")
+)
+
+# Combine predictions
+all_pred <- 
+bind_rows(
+#lr_res   |> collect_predictions()  |> mutate(model = "Logistic Regression"),
+#knn_res  |> collect_predictions()  |> mutate(model = "KNN"),
+#rf_res   |> collect_predictions()  |> mutate(model = "Random Forest"),
+xgb_res  |> collect_predictions()  |> mutate(model = "XGBoost"),
+#lgbm_res |> collect_predictions()  |> mutate(model = "LightGBM")
+  )
+```
+
+```{r}
+#| label: plot-roc-by-fold
+
+# inspect results
+# notice the variability between each run
+all_pred |> 
+  group_by(id,model) |># id contains our folds
+  roc_curve(FraudLabel, .pred_1) |>
+  autoplot(aes(col = model)) + facet_wrap(facets = vars(model)) +
+  theme(legend.position = "none") + 
+  labs(title = "ROC by fold for selected algorithms")
+```
+
+```{r, fig.height = 10, out.width = "100%"}
+#| label: plot-res
+
+all_res |> 
+  ggplot() + 
+  geom_col(aes(y = reorder(model, desc(model)), x = mean, fill = model)) +
+  facet_wrap(facets = vars(.metric), ncol = 3) +
+  labs(y = "model") + 
+  xlim(0,1)+
+  theme(panel.border = element_rect(colour = "black", fill=NA, linewidth=1))+
+  theme(legend.position = "none") 
+```
+
+Best performing model by metric
+
+```{r}
+#| label: best-by-metric
+all_res |> 
+  group_by(.metric) |> 
+  slice_max(mean) |>  
+  select(.metric, mean, model)
+```
+
+```{r}
+all_res |> filter(model == "XGBoost") 
+```
+
+LightGBMoost had the highest AUC-ROC but XGBoost performed well overall.
+
+SENSITIVITY: Logistic Reg → XGBoost → LightGBM - ensure the model can predict true positive (fraud) well.
+SPECIFICITY: LightGBM → XGBoost → Logistic Regression
+AUC: LightGBM → XGBoost → Logistic Regression
+PPV: LightGBM → XGBoost → Logistic Regression
+
+Excluding KNN and Random Forest due to long processing time. 
+
+
+### Choose best model
+
+Select the best model (could use other criteria)
+
+
+```{r}
+all_res |> filter(.metric == "sensitivity") |> slice_max(mean)
+```
+
+Finalise the workflow
+
+```{r}
+#final_wflow <- lgbm_wflow 
+#final_wflow <- lr_wflow 
+final_wflow <- xgb_wflow
+```
+
+## Evaluate
+
+### Evaluate this last fitted model on the test data
+
+Do a final fit (train on training data and test on testing data)
+
+```{r}
+final_fit <- 
+  final_wflow |>
+  last_fit(data_split,
+               metrics = bank_metrics)
+```
+
+```{r}
+final_res <- final_fit |>  collect_metrics()
+final_res
+```
+
+### Generating a ROC/ AUC graph to check the ROC curve and AUC value.
+
+```{r}
+final_pred <- final_fit |>
+  collect_predictions() 
+
+
+final_pred |> 
+  roc_curve(truth = FraudLabel, .pred_1) |> 
+  autoplot()
+
+
+```
+
+### Confusion matrix
+Checking the confusion matrix to understand the model's performance to finalize the model 
+
+```{r}
+final_conf <- final_pred |>
+  conf_mat(truth = FraudLabel, .pred_class) 
+final_conf
+```
+
+```{r}
+summary(final_conf) |> print(n = 13)
+```
+#extract the model's feature importance to understand the key indicators
+```{r}
+
+xgb_model <- extract_fit_engine(final_fit)
+
+# Extract feature importance
+importance <- xgb.importance(model = xgb_model)
+
+print(importance)
+
+importance_df <- as.data.frame(importance)
+
+```
+
+### Visualize the feature importance to identify the key indicators
+
+```{r}
+
+
+#visualise the feature importance
+
+# Plot Gain
+ggplot(importance_df, aes(x = reorder(Feature, Gain), y = Gain)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(title = "Feature Importance by Gain",
+       x = "Feature",
+       y = "Gain") +
+  theme_minimal()
+
+```
