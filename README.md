@@ -80,10 +80,15 @@ Most influential features:
 These provide valuable signals for fraud detection and model explainability.
 
 ---
-
 ##  Tech Stack
 
 - **Language**: R
 - **Packages**: `tidymodels`, `xgboost`, `lightgbm`, `themis`, `ggplot2`, `corrplot`, `ranger`, `kknn`, `parsnip`, `recipes`, `broom`, and more.
+
+---
+
+## Disclaimer
+This project was developed as part of academic coursework and is shared here for educational and portfolio purposes only.
+Unauthorized use, reproduction, or distribution is not permitted and may violate academic integrity policies.
 
 ---
